@@ -342,7 +342,7 @@ static int nk_mmap(struct file *filp, struct vm_area_struct *vma)
         return -ENOMEM;
 
     vma->vm_ops   = &nk_vm_ops;
-    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
     /* Map each vmalloc page individually */
     for (va = g_shm; size > 0;
