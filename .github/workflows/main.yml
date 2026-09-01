@@ -12,94 +12,128 @@ jobs:
 
     steps:
 
+    # ── 1. Checkout ──────────────────────────────────────────────────────
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # ── 2. Host dependencies ─────────────────────────────────────────────
     - name: Install build dependencies
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends \
-          git curl wget python3 make \
-          bc bison flex libssl-dev libelf-dev \
+          git curl wget python3 make bc bison flex \
+          libssl-dev libelf-dev pahole \
           gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-          cpio kmod file ca-certificates
+          cpio kmod file ca-certificates xz-utils
 
-    # Download AOSP Clang 19 (stable, used for GKI 6.1 builds)
-    - name: Download AOSP Clang toolchain
+    # ── 3. Clang toolchain ───────────────────────────────────────────────
+    # ZyCromerZ Clang 19 — same toolchain series used by the original 6.1.ko.sh
+    - name: Download Clang toolchain
       run: |
         mkdir -p $HOME/clang
-        wget -q --show-progress \
+        wget -q --show-progress --tries=3 \
           "https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240618-release/Clang-19.0.0git-20240618.tar.gz" \
           -O /tmp/clang.tar.gz
         tar -xf /tmp/clang.tar.gz -C $HOME/clang
         echo "$HOME/clang/bin" >> $GITHUB_PATH
+        clang_path="$HOME/clang/bin"
+        echo "CLANG_BIN=$clang_path" >> $GITHUB_ENV
         $HOME/clang/bin/clang --version
 
-    # android14-6.1 = GKI 6.1.x stable branch
+    # ── 4. Clone Android Common Kernel 6.1 (ACK) ─────────────────────────
+    # android14-6.1 — same ACK branch as the original 6.1.ko.sh target
     - name: Clone Android common kernel 6.1
       run: |
+        echo "Cloning ACK android14-6.1 (depth=1)..."
         git clone --depth=1 \
           --branch android14-6.1 \
           https://android.googlesource.com/kernel/common \
           $HOME/kernel
         echo "KERNELDIR=$HOME/kernel" >> $GITHUB_ENV
+        head -5 $HOME/kernel/Makefile
 
-    # Stage neko sources from "kernel make files" subfolder
-    - name: Stage driver sources
+    # ── 5. Stage driver sources ───────────────────────────────────────────
+    - name: Stage driver sources into kernel tree
       run: |
         KMOD_DIR=$HOME/kernel/drivers/staging/neko
         mkdir -p "$KMOD_DIR"
-        cp "$GITHUB_WORKSPACE/kernel make files/neko_drv.c"  "$KMOD_DIR/"
-        cp "$GITHUB_WORKSPACE/kernel make files/neko_shm.h"  "$KMOD_DIR/"
-        printf 'obj-m := neko_drv.o\nccflags-y += -I$(src) -g0 -O2 -fno-asynchronous-unwind-tables\n' \
-          > "$KMOD_DIR/Makefile"
-        echo "KMOD_DIR=$KMOD_DIR" >> $GITHUB_ENV
 
+        SRC="$GITHUB_WORKSPACE/kernel make files"
+        cp "$SRC/neko_drv.c"  "$KMOD_DIR/"
+        cp "$SRC/neko_shm.h"  "$KMOD_DIR/"
+
+        # Write KBuild Makefile for external module build
+        printf 'obj-m := neko_drv.o\n' > "$KMOD_DIR/Makefile"
+        printf 'ccflags-y += -I$(src) -g0 -fno-asynchronous-unwind-tables -fno-stack-protector\n' >> "$KMOD_DIR/Makefile"
+
+        echo "KMOD_DIR=$KMOD_DIR" >> $GITHUB_ENV
+        echo "[+] Staged sources:"
+        ls -lh "$KMOD_DIR/"
+
+    # ── 6. Prepare kernel (defconfig + modules_prepare) ──────────────────
     - name: Prepare kernel headers
       run: |
         cd $KERNELDIR
+
+        # GKI defconfig for arm64
         make -j$(nproc) \
           ARCH=arm64 \
           CROSS_COMPILE=aarch64-linux-gnu- \
-          CC=clang \
+          CC=$HOME/clang/bin/clang \
           LLVM=1 LLVM_IAS=1 \
           O=out \
           gki_defconfig
+
+        # Prepare only — no full kernel build needed for external module
         make -j$(nproc) \
           ARCH=arm64 \
           CROSS_COMPILE=aarch64-linux-gnu- \
-          CC=clang \
+          CC=$HOME/clang/bin/clang \
           LLVM=1 LLVM_IAS=1 \
           O=out \
-          modules_prepare
+          scripts prepare modules_prepare
 
+    # ── 7. Build neko_drv.ko ─────────────────────────────────────────────
     - name: Build neko_drv.ko
       run: |
         make -C $KERNELDIR/out \
           M=$KMOD_DIR \
           ARCH=arm64 \
           CROSS_COMPILE=aarch64-linux-gnu- \
-          CC=clang \
+          CC=$HOME/clang/bin/clang \
           LLVM=1 LLVM_IAS=1 \
           modules
-        ls -lh $KMOD_DIR/neko_drv.ko
-        echo "KO_PATH=$KMOD_DIR/neko_drv.ko" >> $GITHUB_ENV
 
-    # Strip only debug-info — keep symbol table for insmod
+        echo "[+] Build result:"
+        ls -lh $KMOD_DIR/neko_drv.ko
+        file $KMOD_DIR/neko_drv.ko
+
+    # ── 8. Strip debug info ───────────────────────────────────────────────
     - name: Strip module
       run: |
-        aarch64-linux-gnu-strip --strip-debug $KO_PATH
-        ls -lh $KO_PATH
+        aarch64-linux-gnu-strip --strip-debug $KMOD_DIR/neko_drv.ko
+        echo "[+] Stripped size: $(wc -c < $KMOD_DIR/neko_drv.ko) bytes"
 
-    # Pack into self-extracting 6.1.ko.sh using pack_ko.sh
+    # ── 9. Pack as 6.1.ko.sh (same format as original) ───────────────────
     - name: Pack as 6.1.ko.sh
       run: |
-        chmod +x "$GITHUB_WORKSPACE/kernel make files/pack_ko.sh"
         sh "$GITHUB_WORKSPACE/kernel make files/pack_ko.sh" \
-          "$KO_PATH" \
+          "$KMOD_DIR/neko_drv.ko" \
           "$GITHUB_WORKSPACE/6.1.ko.sh"
-        ls -lh "$GITHUB_WORKSPACE/6.1.ko.sh"
 
+    # ── 10. Sanity check ─────────────────────────────────────────────────
+    - name: Verify 6.1.ko.sh
+      run: |
+        echo "=== File info ==="
+        ls -lh "$GITHUB_WORKSPACE/6.1.ko.sh"
+        echo "=== Header ==="
+        head -6 "$GITHUB_WORKSPACE/6.1.ko.sh"
+        echo "=== Footer ==="
+        tail -10 "$GITHUB_WORKSPACE/6.1.ko.sh"
+        echo "=== SHA256 ==="
+        sha256sum "$GITHUB_WORKSPACE/6.1.ko.sh"
+
+    # ── 11. Upload artifact ───────────────────────────────────────────────
     - name: Upload 6.1.ko.sh
       uses: actions/upload-artifact@v4
       with:
