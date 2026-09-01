@@ -1,0 +1,178 @@
+name: Build neko_drv — 6.1.ko.sh
+
+# ── triggers ───────────────────────────────────────────────────────────
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+# ── one job, one artifact: 6.1.ko.sh ─────────────────────────────────
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+    # ─── 1. Checkout source ─────────────────────────────────────────
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # ─── 2. Install host dependencies ───────────────────────────────
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          git curl wget python3 python3-pip make \
+          bc bison flex libssl-dev libelf-dev \
+          gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+          cpio kmod file ca-certificates unzip zip
+
+    # ─── 3. Download prebuilt AOSP Clang (r487747c — ships with GKI 6.1) ──
+    - name: Download AOSP Clang toolchain
+      run: |
+        CLANG_BUILD="r487747c"
+        CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-${CLANG_BUILD}.tar.gz"
+        mkdir -p $HOME/clang
+        echo "Fetching clang ${CLANG_BUILD} ..."
+        # Use the raw .tar.gz from Googlesource
+        wget -q --show-progress \
+          "https://storage.googleapis.com/android-infra-releases/toolchains/clang-${CLANG_BUILD}-x86_64.tar.gz" \
+          -O /tmp/clang.tar.gz 2>/dev/null || \
+        wget -q --show-progress \
+          "https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240618-release/Clang-19.0.0git-20240618.tar.gz" \
+          -O /tmp/clang.tar.gz
+        tar -xf /tmp/clang.tar.gz -C $HOME/clang --strip-components=1 2>/dev/null || \
+        tar -xf /tmp/clang.tar.gz -C $HOME/clang
+        echo "CLANG_PATH=$HOME/clang/bin" >> $GITHUB_ENV
+        $HOME/clang/bin/clang --version
+
+    # ─── 4. Clone Android Common Kernel 6.1 ─────────────────────────
+    - name: Clone Android common kernel 6.1
+      run: |
+        # android14-6.1 is the stable GKI 6.1 branch
+        git clone --depth=1 \
+          --branch android14-6.1 \
+          https://android.googlesource.com/kernel/common \
+          $HOME/kernel
+        echo "KERNELDIR=$HOME/kernel" >> $GITHUB_ENV
+
+    # ─── 5. Copy driver sources into kernel staging area ────────────
+    - name: Stage driver sources
+      run: |
+        KMOD_DIR=$HOME/kernel/drivers/staging/neko
+        mkdir -p $KMOD_DIR
+
+        cp $GITHUB_WORKSPACE/neko_drv.c  $KMOD_DIR/
+        cp $GITHUB_WORKSPACE/neko_shm.h  $KMOD_DIR/
+        cp $GITHUB_WORKSPACE/Makefile     $KMOD_DIR/neko.mk.bak  # keep ref
+
+        # Write a standalone KBuild Makefile in the staging dir
+        cat > $KMOD_DIR/Makefile << 'KBUILD_EOF'
+obj-m := neko_drv.o
+ccflags-y += -I$(src) -g0 -fno-asynchronous-unwind-tables
+KBUILD_EOF
+
+        echo "KMOD_DIR=$KMOD_DIR" >> $GITHUB_ENV
+
+    # ─── 6. Prepare kernel (generate Module.symvers via defconfig) ──
+    - name: Prepare kernel headers / symvers
+      run: |
+        export PATH="$CLANG_PATH:$PATH"
+        cd $KERNELDIR
+
+        # Use GKI defconfig for arm64
+        make -j$(nproc) \
+          ARCH=arm64 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CC=clang \
+          LLVM=1 LLVM_IAS=1 \
+          O=out \
+          gki_defconfig
+
+        # Build only enough to satisfy external module build
+        make -j$(nproc) \
+          ARCH=arm64 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CC=clang \
+          LLVM=1 LLVM_IAS=1 \
+          O=out \
+          modules_prepare
+
+    # ─── 7. Build external module ────────────────────────────────────
+    - name: Build neko_drv.ko
+      run: |
+        export PATH="$CLANG_PATH:$PATH"
+        make -C $KERNELDIR/out \
+          M=$KMOD_DIR \
+          ARCH=arm64 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CC=clang \
+          LLVM=1 LLVM_IAS=1 \
+          modules
+        ls -lh $KMOD_DIR/neko_drv.ko
+
+    # ─── 8. Strip .ko (reduce size / readable strings) ───────────────
+    - name: Strip module
+      run: |
+        aarch64-linux-gnu-strip --strip-debug $KMOD_DIR/neko_drv.ko
+
+    # ─── 9. Pack as self-extracting 6.1.ko.sh ───────────────────────
+    # Identical pattern to the original 6.1.ko.sh:
+    #   sh ./6.1.ko.sh  →  loads the .ko automatically on target device
+    - name: Pack as 6.1.ko.sh
+      run: |
+        KO=$KMOD_DIR/neko_drv.ko
+        OUT=$GITHUB_WORKSPACE/6.1.ko.sh
+
+        B64=$(base64 -w 76 $KO)
+
+        cat > $OUT << 'HEADER_EOF'
+#!/bin/sh
+# neko_drv — stealth memory driver for Android GKI 6.1.x
+# Usage: sh ./6.1.ko.sh
+set -e
+TMP=$(mktemp /data/local/tmp/neko_XXXXXX.ko)
+trap "rm -f \"$TMP\"" EXIT INT TERM
+base64 -d << '__EMBEDDED_KO_B64__' > "$TMP"
+HEADER_EOF
+
+        # Append base64 blob
+        echo "$B64" >> $OUT
+        echo '__EMBEDDED_KO_B64__' >> $OUT
+
+        # Append loader footer
+        cat >> $OUT << 'FOOTER_EOF'
+
+# ── load ────────────────────────────────────────────────────────────────
+_kv() { uname -r | cut -d. -f1,2; }
+_ver=$(_kv)
+case "$_ver" in
+    6.1) : ;;
+    *)   echo "[!] Warning: kernel $_ver may not be compatible (tested on 6.1.x)." ;;
+esac
+
+# rmmod old instance silently
+rmmod neko_drv 2>/dev/null || true
+sleep 0.2
+
+# insmod
+if insmod "$TMP"; then
+    echo "[+] neko_drv loaded — /dev/neko ready"
+else
+    echo "[-] insmod failed. Is GKI signing enforced?"
+    echo "    Try: magisk policy or KernelSU allow-list"
+    exit 1
+fi
+FOOTER_EOF
+
+        chmod +x $OUT
+        ls -lh $OUT
+        echo "SHA256: $(sha256sum $OUT)"
+
+    # ─── 10. Upload artifact ─────────────────────────────────────────
+    - name: Upload 6.1.ko.sh
+      uses: actions/upload-artifact@v4
+      with:
+        name: neko-6.1-driver
+        path: 6.1.ko.sh
+        retention-days: 30
