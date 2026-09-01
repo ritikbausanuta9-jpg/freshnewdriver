@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
 
@@ -24,6 +24,7 @@ jobs:
           gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
           cpio kmod file ca-certificates
 
+    # Download AOSP Clang 19 (stable, used for GKI 6.1 builds)
     - name: Download AOSP Clang toolchain
       run: |
         mkdir -p $HOME/clang
@@ -34,6 +35,7 @@ jobs:
         echo "$HOME/clang/bin" >> $GITHUB_PATH
         $HOME/clang/bin/clang --version
 
+    # android14-6.1 = GKI 6.1.x stable branch
     - name: Clone Android common kernel 6.1
       run: |
         git clone --depth=1 \
@@ -42,13 +44,14 @@ jobs:
           $HOME/kernel
         echo "KERNELDIR=$HOME/kernel" >> $GITHUB_ENV
 
+    # Stage neko sources from "kernel make files" subfolder
     - name: Stage driver sources
       run: |
         KMOD_DIR=$HOME/kernel/drivers/staging/neko
         mkdir -p "$KMOD_DIR"
-        cp $GITHUB_WORKSPACE/neko_drv.c "$KMOD_DIR/"
-        cp $GITHUB_WORKSPACE/neko_shm.h "$KMOD_DIR/"
-        printf 'obj-m := neko_drv.o\nccflags-y += -I$(src) -g0 -fno-asynchronous-unwind-tables\n' \
+        cp "$GITHUB_WORKSPACE/kernel make files/neko_drv.c"  "$KMOD_DIR/"
+        cp "$GITHUB_WORKSPACE/kernel make files/neko_shm.h"  "$KMOD_DIR/"
+        printf 'obj-m := neko_drv.o\nccflags-y += -I$(src) -g0 -O2 -fno-asynchronous-unwind-tables\n' \
           > "$KMOD_DIR/Makefile"
         echo "KMOD_DIR=$KMOD_DIR" >> $GITHUB_ENV
 
@@ -80,16 +83,22 @@ jobs:
           LLVM=1 LLVM_IAS=1 \
           modules
         ls -lh $KMOD_DIR/neko_drv.ko
+        echo "KO_PATH=$KMOD_DIR/neko_drv.ko" >> $GITHUB_ENV
 
+    # Strip only debug-info — keep symbol table for insmod
     - name: Strip module
       run: |
-        aarch64-linux-gnu-strip --strip-debug $KMOD_DIR/neko_drv.ko
+        aarch64-linux-gnu-strip --strip-debug $KO_PATH
+        ls -lh $KO_PATH
 
+    # Pack into self-extracting 6.1.ko.sh using pack_ko.sh
     - name: Pack as 6.1.ko.sh
       run: |
-        sh $GITHUB_WORKSPACE/pack_ko.sh \
-          $KMOD_DIR/neko_drv.ko \
-          $GITHUB_WORKSPACE/6.1.ko.sh
+        chmod +x "$GITHUB_WORKSPACE/kernel make files/pack_ko.sh"
+        sh "$GITHUB_WORKSPACE/kernel make files/pack_ko.sh" \
+          "$KO_PATH" \
+          "$GITHUB_WORKSPACE/6.1.ko.sh"
+        ls -lh "$GITHUB_WORKSPACE/6.1.ko.sh"
 
     - name: Upload 6.1.ko.sh
       uses: actions/upload-artifact@v4
